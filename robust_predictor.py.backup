@@ -254,30 +254,17 @@ class RobustPositionPredictor(IPositionPredictor):
         return LatLon(lat, lon)
     
     def _calculate_yolo_confidence(self, class_weights: List[float], class_locs: List[LatLon]) -> float:
-        """
-        Improved confidence calculation for YOLO-based prediction.
-        Takes into account weight quality, detection count, and spatial consistency.
-        """
+        """Calculate confidence for YOLO-based prediction"""
         if not class_weights:
             return 0.0
             
-        # Base confidence from detection weights (weighted average, not just mean)
-        total_weight = sum(class_weights)
-        if total_weight < 1e-6:
-            return 0.0
+        # Base confidence from detection weights
+        base_confidence = np.mean(class_weights)
         
-        # Weighted average gives more importance to high-confidence detections
-        base_confidence = np.mean(class_weights) if len(class_weights) > 0 else 0.0
+        # Bonus for multiple detections
+        detection_bonus = min(len(class_weights) / 3.0, 1.0) * 0.2
         
-        # Quality of weights: higher max weight = better quality detections
-        max_weight = max(class_weights) if class_weights else 0.0
-        weight_quality = min(max_weight / (total_weight / len(class_weights) + 1e-6), 2.0) * 0.15
-        
-        # Bonus for multiple detections (more detections = more reliable)
-        detection_bonus = min(len(class_weights) / 3.0, 1.0) * 0.25
-        
-        # Improved penalty for large spread in detections
-        # Clustered detections are more reliable than scattered ones
+        # Penalty for large spread in detections
         if len(class_locs) > 1:
             distances = []
             for i in range(len(class_locs)):
@@ -287,26 +274,17 @@ class RobustPositionPredictor(IPositionPredictor):
                     distances.append(dist)
             if distances:
                 avg_distance = np.mean(distances)
-                std_distance = np.std(distances) if len(distances) > 1 else 0.0
-                # Penalty increases with both average distance and inconsistency
-                spread_penalty = min(avg_distance / 200.0, 1.0) * 0.25
-                consistency_penalty = min(std_distance / 100.0, 1.0) * 0.1 if std_distance > 0 else 0.0
+                spread_penalty = min(avg_distance / 200.0, 1.0) * 0.3
             else:
                 spread_penalty = 0.0
-                consistency_penalty = 0.0
         else:
             spread_penalty = 0.0
-            consistency_penalty = 0.0
-        
-        # Combined confidence
-        confidence = base_confidence + weight_quality + detection_bonus - spread_penalty - consistency_penalty
+            
+        confidence = base_confidence + detection_bonus - spread_penalty
         return max(0.0, min(1.0, confidence))
     
     def _is_prediction_valid(self, prediction: LatLon, confidence: float) -> bool:
-        """
-        Improved outlier detection for YOLO predictions.
-        Checks for large jumps, velocity consistency, and position history.
-        """
+        """Check if prediction is valid (not an outlier)"""
         if self.last_position is None or confidence < self.config.min_detection_confidence:
             return True  # Can't validate without reference
             
@@ -314,47 +292,14 @@ class RobustPositionPredictor(IPositionPredictor):
         distance = haversine_m(self.last_position.lat, self.last_position.lon,
                              prediction.lat, prediction.lon)
         
-        # Absolute distance check
         if distance > self.max_jump_distance:
             return False
-        
-        # Check against velocity history (improved)
+            
+        # Check against velocity history
         if len(self.velocity_history) > 0:
-            # Calculate expected displacement from velocity
-            velocities = np.array([np.sqrt(v[0]**2 + v[1]**2) for v in self.velocity_history])
-            avg_velocity = np.mean(velocities)
-            max_velocity = np.max(velocities) if len(velocities) > 0 else 0.0
-            
-            # Expected displacement based on average velocity
-            expected_displacement = avg_velocity * self.last_dt
-            
-            # Allow up to 3x expected movement, but also check against max velocity
-            max_expected = max_velocity * self.last_dt * 2.5  # More lenient for acceleration
-            
-            if distance > max(expected_displacement * 3.0, max_expected):
+            expected_displacement = np.mean([v[0]**2 + v[1]**2 for v in self.velocity_history]) * self.last_dt
+            if distance > expected_displacement * 3.0:  # 3x expected movement
                 return False
-        
-        # Check against position history (new)
-        # If we have recent positions, check if prediction is consistent with trend
-        if len(self.position_history) >= 3:
-            recent_positions = list(self.position_history)[-3:]
-            # Calculate trend direction
-            prev_pos = recent_positions[-2]
-            curr_pos = recent_positions[-1]
-            
-            # Expected direction based on recent movement
-            dx_trend, dy_trend = latlon_to_xy_m(curr_pos.lat, curr_pos.lon, prev_pos.lat, prev_pos.lon)
-            
-            # Actual direction of new prediction
-            dx_actual, dy_actual = latlon_to_xy_m(prediction.lat, prediction.lon, curr_pos.lat, curr_pos.lon)
-            
-            # Check if direction is consistent (not 180° opposite)
-            if abs(dx_trend) > 1.0 or abs(dy_trend) > 1.0:  # Only if we're actually moving
-                dot_product = dx_trend * dx_actual + dy_trend * dy_actual
-                if dot_product < -0.5 * (dx_trend**2 + dy_trend**2):  # More than 90° opposite
-                    # Only reject if distance is also large
-                    if distance > 20.0:  # Allow small corrections even if opposite
-                        return False
                 
         return True
     

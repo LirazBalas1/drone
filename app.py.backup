@@ -1,6 +1,5 @@
 import cv2
 import pandas as pd
-import numpy as np
 from collections import defaultdict
 from typing import List, Tuple
 from config import AppCfg
@@ -196,8 +195,6 @@ def main():
             # --- Class center dots + label GPS ---
             class_weights = []
             class_locs = []
-            # Camera center for position-based weighting
-            ccx, ccy = W // 2, H // 2
             for b in kept_locked:
                 x1, y1, x2, y2 = b.xyxy
                 cx, cy = int((x1 + x2)/2), int((y1 + y2)/2)
@@ -208,22 +205,8 @@ def main():
                 if ll:
                     cv2.putText(frame, f"{ll.lat:.6f}, {ll.lon:.6f}", (cx+8, cy-8),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 200, 50), 2, cv2.LINE_AA)
-                    
-                    # Improved weights: score * area * confidence * center_proximity
-                    # Center proximity: buildings closer to center (where camera looks at 60°) get higher weight
-                    # Distance from center normalized by frame size
-                    dx_from_center = abs(cx - ccx) / W
-                    dy_from_center = abs(cy - ccy) / H
-                    distance_from_center = np.sqrt(dx_from_center**2 + dy_from_center**2)
-                    # Boost weight for detections near center (up to 1.5x for center, 1.0x for edges)
-                    center_boost = 1.0 + 0.5 * (1.0 - min(distance_from_center * 2.0, 1.0))
-                    
-                    # Area normalization (larger buildings = more reliable)
-                    area_norm = ((x2-x1)*(y2-y1)) / (W*H)
-                    area_factor = 1.0 + 0.5 * area_norm
-                    
-                    # Combined weight: stability_score * area_factor * confidence * center_boost
-                    w = (score.get(cname, 0.0)) * area_factor * max(b.conf, 1e-3) * center_boost
+                    # weights: score * (1+0.5*area_norm) * conf
+                    w = (score.get(cname, 0.0)) * (1.0 + 0.5 * (((x2-x1)*(y2-y1)) / (W*H))) * max(b.conf, 1e-3)
                     class_weights.append(w)
                     class_locs.append(ll)
 
