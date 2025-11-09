@@ -9,14 +9,13 @@ from tiles import CachedHttpTileProvider
 from hud import HudRenderer
 from detector.yolo_ultra import YoloUltranyxDetector
 from stability import StabilityGate
-from estimator import PositionEstimator
+from estimator import PositionEstimator, WeightedBarycenterPredictor, EmaPositionSmoother, DisplacementSpeedEstimator, KalmanCvSmoother
+from robust_predictor import RobustPositionPredictor, RobustPredictorConfig
+from robust_speed_estimator import RobustSpeedEstimator, RobustSpeedConfig
 from dedup import deduplicate_by_class
 from video_io import Cv2VideoWriter
-from geo import haversine_m
-from optical_flow import OpticalFlowTracker
-from north_calibration import NorthCalibration
-from adaptive_learning import AdaptiveLearningSystem, PerformanceMetrics
-from motion_predictor import MotionPredictor
+from geo import haversine_m, offset_latlon_by_m
+import traceback
 
 def overlay_bottom_right(frame, overlay_img, pad=12):
     H, W = frame.shape[:2]
@@ -72,35 +71,6 @@ def main():
 
     # --- Detector ---
     det = YoloUltranyxDetector(cfg.model)
-    
-    # --- North Calibration ---
-    north_calibration = NorthCalibration(
-        image_width=1920,  # Will be updated from first frame
-        image_height=1080,
-        camera_angle_deg=60.0
-    )
-    
-    # --- Adaptive Learning System ---
-    adaptive_learning = AdaptiveLearningSystem(
-        learning_rate=0.1,
-        memory_size=1000,
-        adaptation_threshold=0.1
-    )
-    
-    # --- Motion Predictor ---
-    motion_predictor = MotionPredictor(
-        prediction_horizon=2.0,  # 2 seconds ahead
-        history_size=50,
-        learning_system=adaptive_learning
-    )
-    
-    # --- Optical Flow Tracker ---
-    flow_tracker = OpticalFlowTracker(
-        camera_angle_deg=60.0,  # 60 degrees downward
-        north_orientation_deg=0.0,  # Will be updated by north calibration
-        flow_alpha=0.3,
-        camera_height_m=100.0  # Default altitude
-    )
 
     # --- Tile/HUD ---
     tp = CachedHttpTileProvider(
@@ -120,7 +90,60 @@ def main():
         lock_thresh=cfg.stability.lock_thresh,
         unlock_thresh=cfg.stability.unlock_thresh,
     )
-    est = PositionEstimator(lat0, lon0, pos_alpha=cfg.smooth.pos_alpha)
+    # --- Estimator (Strategy-based with modular algorithms) ---
+    # Create predictor based on config
+    if cfg.algo.predictor == "robust":
+        predictor_config = RobustPredictorConfig(
+            yolo_confidence_threshold=cfg.robust.yolo_confidence_threshold,
+            yolo_stability_threshold=cfg.robust.yolo_stability_threshold,
+            flow_confidence_threshold=cfg.robust.flow_confidence_threshold,
+            flow_stability_threshold=cfg.robust.flow_stability_threshold,
+            flow_primary_weight=cfg.robust.flow_primary_weight,
+            max_jump_distance_m=cfg.robust.max_jump_distance_m,
+            min_detection_confidence=cfg.robust.min_detection_confidence,
+            outlier_rejection_enabled=cfg.robust.outlier_rejection_enabled,
+            history_length=cfg.robust.history_length,
+            position_alpha=cfg.robust.position_alpha,
+            velocity_alpha=cfg.robust.velocity_alpha,
+            min_yolo_detections=cfg.robust.min_yolo_detections,
+            flow_fallback_enabled=cfg.robust.flow_fallback_enabled,
+            hybrid_mode_enabled=cfg.robust.hybrid_mode_enabled
+        )
+        predictor = RobustPositionPredictor(lat0, lon0, predictor_config)
+        print("[INFO] Predictor: Robust (YOLO + Optical Flow)")
+    else:
+        predictor = WeightedBarycenterPredictor(lat0, lon0)
+        print("[INFO] Predictor: Weighted Barycenter")
+    
+    # Create smoother based on config
+    if cfg.algo.smoother == "kalman":
+        smoother = KalmanCvSmoother(lat0, lon0)
+        print("[INFO] Smoother: Kalman (CV)")
+    else:
+        smoother = EmaPositionSmoother(alpha=cfg.smooth.pos_alpha)
+        print("[INFO] Smoother: EMA")
+    
+    # Create speed estimator based on config
+    if cfg.algo.speed == "robust" and cfg.algo.predictor == "robust":
+        # Use robust speed estimator with flow detector from predictor
+        speed_config = RobustSpeedConfig(
+            position_alpha=cfg.robust.position_alpha,
+            flow_alpha=cfg.robust.velocity_alpha,
+            flow_weight=cfg.robust.flow_primary_weight,
+            max_speed_kmh=100.0,
+            min_speed_kmh=0.1,
+            speed_smoothing_alpha=cfg.smooth.speed_alpha,
+            history_length=cfg.robust.history_length,
+            outlier_rejection_enabled=cfg.robust.outlier_rejection_enabled,
+            max_speed_change_ratio=0.5
+        )
+        speed_est = RobustSpeedEstimator(speed_config, predictor.flow_detector)
+        print("[INFO] Speed Estimator: Robust (Position + Flow)")
+    else:
+        speed_est = DisplacementSpeedEstimator(speed_alpha=cfg.smooth.speed_alpha)
+        print("[INFO] Speed Estimator: Displacement")
+    
+    est = PositionEstimator(predictor, smoother, speed_est)
 
     # --- Video Output (initialized on first frame to avoid double-reading for size) ---
     wtr = None
@@ -128,18 +151,25 @@ def main():
     print(f"[INFO] Target FPS (from SRT): {fps:.2f}")
 
     path_pred: List[LatLon] = []
+    spd_gt_state = 0.0  # EMA for SRT speed (m/s)
+    vis_spd_kmh = 0.0   # visualized algo speed (km/h) after slew + quantize
+    vis_spd_gt_kmh = 0.0  # visualized SRT speed (km/h) after slew + quantize
     frame_idx = 0
 
     try:
         for frame_det in det.stream(cfg.video.input_path):
             frame = frame_det.frame_bgr
             names = frame_det.names
-            
+
             # lazily initialize writer with first frame size
             if wtr is None:
                 H, W = frame.shape[:2]
                 wtr = Cv2VideoWriter(cfg.video.output_path, fps=fps, size=(W, H))
                 print(f"[INFO] Video parameters: {W}x{H} @ {fps:.2f}fps")
+            # per-frame visual smoothing params (shared)
+            kmh_rate = cfg.smooth.speed_max_kmh_rate
+            quantum = cfg.smooth.speed_quantum_kmh
+            delta_max = kmh_rate * dt
 
             # --- Deduplicate per class (except "other") ---
             kept, class_conf = deduplicate_by_class(frame_det.boxes, names, "other")
@@ -152,32 +182,6 @@ def main():
 
             # Keep only locked classes
             kept_locked: List[BoxDet] = [b for b in kept if names[b.cls_id] != "other" and gate.is_locked(names[b.cls_id])]
-            
-            # --- Update North Calibration ---
-            # Prepare building data for north detection
-            buildings_data = []
-            for b in kept_locked:
-                x1, y1, x2, y2 = b.xyxy.astype(int)
-                buildings_data.append({
-                    'bbox': [x1, y1, x2, y2],
-                    'confidence': b.conf
-                })
-            
-            # Detect north direction
-            north_angle, north_confidence = north_calibration.detect_north_direction(
-                frame, buildings=buildings_data
-            )
-            
-            # Update optical flow tracker with north direction
-            if north_confidence > 0.3:
-                flow_tracker.north_orientation_deg = north_angle
-                flow_tracker.camera_calibration.north_orientation_deg = north_angle
-            
-            # --- Update Optical Flow ---
-            flow_result = flow_tracker.update(frame)
-            flow_x, flow_y, flow_confidence = 0.0, 0.0, 0.0
-            if flow_result is not None:
-                flow_x, flow_y, flow_confidence = flow_result
 
             # --- Draw Ultralytics style overlays (minimal, no blur tricks) ---
             # Avoid rescaling; draw directly on `frame`.
@@ -206,91 +210,96 @@ def main():
                     class_weights.append(w)
                     class_locs.append(ll)
 
-            # --- Optical Flow Position Estimation ---
-            flow_position = None
-            if flow_confidence > 0.3:
-                # Get optical flow position estimate
-                pixel_to_meter_ratio = 0.1  # Adjust based on altitude and camera specs
-                if pred_s is not None:
-                    flow_position = flow_tracker.get_movement_estimate(pred_s, pixel_to_meter_ratio)
-                elif len(path_pred) > 0:
-                    # Use last known position for flow estimation
-                    flow_position = flow_tracker.get_movement_estimate(path_pred[-1], pixel_to_meter_ratio)
+            # --- Update optical flow if enabled ---
+            if cfg.flow.enabled and frame_idx < len(srt):
+                alt = srt[frame_idx].get("alt")
+                if isinstance(alt, (int, float)) and alt > 0:
+                    est.update_flow(frame, dt, float(alt), cfg.camera.fov_x_deg, cfg.camera.fov_y_deg, cfg.camera.pitch_deg)
             
-            # --- Enhanced Position Estimation with Optical Flow Integration ---
-            pred_s, spd_mps, spd_kmh = est.estimate(
-                class_weights, class_locs, dt, 
-                flow_position=flow_position, 
-                flow_confidence=flow_confidence
-            )
-            
-            # --- Adaptive Learning and Motion Prediction ---
+            # --- Estimate position & speed ---
+            pred_s, _, spd_kmh = est.estimate(class_weights, class_locs, dt)
             if pred_s is not None:
-                # Update motion predictor
-                current_time = frame_idx * dt
-                motion_state = motion_predictor.update_motion_state(pred_s, current_time)
-                
-                # Get motion prediction
-                motion_prediction = motion_predictor.predict_motion(current_time, use_learning=True)
-                
-                # Apply adaptive parameters to estimator
-                adaptive_params = adaptive_learning.get_adaptive_parameters()
-                if adaptive_params:
-                    # Update estimator with adaptive parameters
-                    est.pos_alpha = adaptive_params.get('stability_alpha', est.pos_alpha)
-                
-                # Update prediction accuracy for learning
-                if len(path_pred) > 0 and motion_prediction:
-                    motion_predictor.update_prediction_accuracy(
-                        motion_prediction.predicted_position, pred_s
-                    )
-                
                 path_pred.append(pred_s)
 
-            # --- Draw Optical Flow Visualization ---
-            frame = flow_tracker.draw_flow_visualization(frame)
-            
-            # --- Draw North Direction Indicator ---
-            frame = north_calibration.draw_north_indicator(frame)
-            
-            # --- Overlays: PRED, SPD, SRT, ERR, FLOW ---
+            # --- Overlays: PRED, SPD, SRT, ERR ---
             y0 = 30
             if pred_s is not None:
                 cv2.putText(frame, f"PRED {pred_s.lat:.6f}, {pred_s.lon:.6f}", (20, y0),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2, cv2.LINE_AA)
                 y0 += 30
-                cv2.putText(frame, f"SPD  {spd_mps:5.1f} m/s  ({spd_kmh:5.1f} km/h)", (20, y0),
+                # Visual rate limiting + quantization for smoother perception
+                target_kmh = float(spd_kmh)
+                dv = max(min(target_kmh - vis_spd_kmh, delta_max), -delta_max)
+                vis_spd_kmh = vis_spd_kmh + dv
+                vis_spd_kmh_draw = round(vis_spd_kmh / quantum) * quantum if quantum > 0 else vis_spd_kmh
+                cv2.putText(frame, f"SPD  {vis_spd_kmh_draw:5.1f} km/h", (20, y0),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,255), 2, cv2.LINE_AA)
                 y0 += 30
-                
-                # Optical Flow information
-                if flow_confidence > 0.1:
-                    cv2.putText(frame, f"FLOW {flow_x:6.1f}, {flow_y:6.1f} (conf: {flow_confidence:.2f})", (20, y0),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255,0,255), 2, cv2.LINE_AA)
-                    y0 += 25
-                
-                # Adaptive Learning information
-                learning_status = adaptive_learning.get_learning_status()
-                if learning_status['is_learning']:
-                    cv2.putText(frame, f"LEARNING: {learning_status['learning_confidence']:.2f} (adapt: {learning_status['adaptation_count']})", (20, y0),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,255), 2, cv2.LINE_AA)
-                    y0 += 20
-                
-                # Motion Prediction information
-                motion_stats = motion_predictor.get_motion_statistics()
-                if motion_stats:
-                    cv2.putText(frame, f"PREDICT: {motion_stats.get('prediction_accuracy', 0):.2f} (speed: {motion_stats.get('avg_speed', 0):.1f})", (20, y0),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255,255,0), 2, cv2.LINE_AA)
-                    y0 += 20
 
             if frame_idx < len(srt) and pred_s is not None:
                 gt_lat = srt[frame_idx]["lat"]; gt_lon = srt[frame_idx]["lon"]
                 err_m = haversine_m(pred_s.lat, pred_s.lon, gt_lat, gt_lon)
+                # compute ground-truth speed from SRT (m/s)
+                if frame_idx > 0:
+                    prev_gt_lat = srt[frame_idx-1]["lat"]; prev_gt_lon = srt[frame_idx-1]["lon"]
+                    d_gt = haversine_m(prev_gt_lat, prev_gt_lon, gt_lat, gt_lon)
+                    # Prefer per-frame dt_ms if available
+                    if "dt_ms" in srt[frame_idx]:
+                        dt_gt = max(srt[frame_idx]["dt_ms"], 1e-3) / 1000.0
+                    else:
+                        dt_gt = dt
+                    spd_gt_mps = d_gt / dt_gt if dt_gt > 0 else 0.0
+                    # Smooth SRT speed to reduce flicker
+                    a = cfg.smooth.speed_alpha
+                    spd_gt_state = (1 - a) * spd_gt_state + a * spd_gt_mps
+                else:
+                    spd_gt_mps = 0.0
+                    spd_gt_state = (1 - cfg.smooth.speed_alpha) * spd_gt_state
                 cv2.putText(frame, f"SRT  {gt_lat:.6f}, {gt_lon:.6f}", (20, y0),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,255,0), 2, cv2.LINE_AA)
                 y0 += 30
                 cv2.putText(frame, f"ERR  {err_m:6.1f} m", (20, y0),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,200,255), 2, cv2.LINE_AA)
+                y0 += 30
+                # Slew + quantize SRT speed for visual stability
+                target_gt_kmh = float(spd_gt_state * 3.6)
+                dv_gt = max(min(target_gt_kmh - vis_spd_gt_kmh, delta_max), -delta_max)
+                vis_spd_gt_kmh = vis_spd_gt_kmh + dv_gt
+                vis_spd_gt_kmh_draw = round(vis_spd_gt_kmh / quantum) * quantum if quantum > 0 else vis_spd_gt_kmh
+                cv2.putText(frame, f"SPD_GT {vis_spd_gt_kmh_draw:5.1f} km/h", (20, y0),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.7, (150,200,255), 2, cv2.LINE_AA)
+                y0 += 30
+                
+                # Enhanced system information display
+                if cfg.algo.predictor == "robust":
+                    # Show current prediction mode
+                    mode = est.get_current_mode()
+                    if mode == "yolo":
+                        mode_color = (0, 255, 0)
+                    elif mode == "flow":
+                        mode_color = (0, 255, 255)
+                    else:
+                        mode_color = (255, 255, 0)
+                    cv2.putText(frame, f"MODE: {mode.upper()}", (20, y0),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, mode_color, 2, cv2.LINE_AA)
+                    y0 += 25
+                    
+                    # Show flow information if available
+                    if cfg.flow.enabled:
+                        flow_speed = est.get_flow_speed_kmh()
+                        flow_heading = est.get_flow_heading_deg()
+                        flow_stable = est.is_flow_stable()
+                        
+                        if flow_speed > 0.1:
+                            flow_color = (0, 255, 255) if flow_stable else (0, 200, 200)
+                            cv2.putText(frame, f"FLOW: {flow_speed:.1f} km/h {flow_heading:.0f}° {'STABLE' if flow_stable else 'UNSTABLE'}", 
+                                       (20, y0), cv2.FONT_HERSHEY_SIMPLEX, 0.6, flow_color, 2, cv2.LINE_AA)
+                            y0 += 25
+                    
+                    # Show detection count and confidence
+                    cv2.putText(frame, f"DETECTIONS: {len(class_weights)}", (20, y0),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2, cv2.LINE_AA)
+                    y0 += 25
 
             # --- Camera center reticle ---
             ch, cw = frame.shape[:2]
@@ -309,7 +318,26 @@ def main():
                     d = haversine_m(pred_s.lat, pred_s.lon, ll.lat, ll.lon)
                     if d <= cfg.hud.building_radius_m:
                         nearby.append((name, ll))
-                hud_img = hud.render(pred_s, path_pred, nearby)
+                # Camera offset correction: predicted point is center-ray ground point; camera is south of it by d_center
+                # Use altitude from SRT when available
+                d_center_m = None
+                if frame_idx < len(srt):
+                    alt = srt[frame_idx].get("alt")
+                    if isinstance(alt, (int, float)) and alt > 0:
+                        import math
+                        theta = math.radians(max(1.0, min(89.0, cfg.camera.pitch_deg)))
+                        d_center_m = alt / math.tan(theta)
+                if d_center_m is not None:
+                    cam_lat, cam_lon = offset_latlon_by_m(pred_s.lat, pred_s.lon, north_m=-d_center_m, east_m=0.0)
+                    cam_pred = LatLon(cam_lat, cam_lon)
+                else:
+                    cam_pred = pred_s
+
+                actual = None
+                if frame_idx < len(srt):
+                    actual = LatLon(srt[frame_idx]["lat"], srt[frame_idx]["lon"])
+                # Center HUD on camera-predicted location for better parallax representation
+                hud_img = hud.render(cam_pred, path_pred, nearby, actual=actual)
                 frame = overlay_bottom_right(frame, hud_img, pad=12)
 
             # --- IO ---
@@ -323,19 +351,15 @@ def main():
 
             frame_idx += 1
 
+    except Exception as e:
+        print("[ERROR] Unhandled exception in main loop:", e)
+        traceback.print_exc()
+        raise
     finally:
         if wtr is not None:
             wtr.close()
         if cfg.video.preview:
             cv2.destroyAllWindows()
-        
-        # Save adaptive learning state
-        try:
-            adaptive_learning.save_learning_state("adaptive_learning_state.json")
-            print(f"[INFO] Saved adaptive learning state")
-        except Exception as e:
-            print(f"[WARNING] Failed to save learning state: {e}")
-        
         print(f"[DONE] Saved: {cfg.video.output_path}")
 
 if __name__ == "__main__":

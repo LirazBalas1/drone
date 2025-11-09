@@ -1,111 +1,180 @@
-from typing import Dict, List, Tuple, Optional
+from typing import List, Tuple, Optional
 import numpy as np
 from geo import latlon_to_xy_m, xy_m_to_latlon, haversine_m
-from core_types import LatLon
+from core_types import LatLon, IPositionPredictor, IPositionSmoother, ISpeedEstimator
+from robust_predictor import RobustPositionPredictor, RobustPredictorConfig
+from robust_speed_estimator import RobustSpeedEstimator, RobustSpeedConfig
 
-class PositionEstimator:
-    def __init__(self, lat0: float, lon0: float, pos_alpha: float):
+
+class WeightedBarycenterPredictor(IPositionPredictor):
+    def __init__(self, lat0: float, lon0: float):
         self.lat0 = lat0
         self.lon0 = lon0
-        self.pos_alpha = pos_alpha
-        self.pred_s: Optional[LatLon] = None
-        self.prev_s: Optional[LatLon] = None
-        
-        # Enhanced position tracking
-        self.position_history = []
-        self.max_history = 10
-        self.flow_position_history = []
-        self.detection_confidence_history = []
 
-    def estimate(self,
-                 class_weights: List[float],
-                 class_locs: List[LatLon],
-                 dt: float,
-                 flow_position: Optional[LatLon] = None,
-                 flow_confidence: float = 0.0) -> Tuple[Optional[LatLon], float, float]:
-        """
-        Enhanced position estimation with optical flow integration.
-        Returns: (smoothed_position, speed_mps, speed_kmh)
-        """
-        detection_confidence = 0.0
-        
+    def predict(self, class_weights: List[float], class_locs: List[LatLon]) -> Optional[LatLon]:
         if not class_weights:
-            # Use optical flow if no building detections
-            if flow_position is not None and flow_confidence > 0.3:
-                if self.pred_s is None:
-                    self.pred_s = flow_position
-                else:
-                    # Blend with optical flow
-                    blend_factor = min(0.5, flow_confidence)
-                    self.pred_s = LatLon(
-                        lat=self.pred_s.lat * (1 - blend_factor) + flow_position.lat * blend_factor,
-                        lon=self.pred_s.lon * (1 - blend_factor) + flow_position.lon * blend_factor
-                    )
-                detection_confidence = flow_confidence
-            else:
-                return self.pred_s, 0.0, 0.0
-        else:
-            # Building-based detection
-            w = np.asarray(class_weights, dtype=float)
-            w = w / (w.sum() + 1e-9)
-            detection_confidence = float(np.mean(w))
+            return None
+        w = np.asarray(class_weights, dtype=float)
+        w = w / (w.sum() + 1e-9)
+        xs, ys = [], []
+        for w_i, ll in zip(w, class_locs):
+            x, y = latlon_to_xy_m(ll.lat, ll.lon, self.lat0, self.lon0)
+            xs.append(w_i * x)
+            ys.append(w_i * y)
+        xw, yw = float(np.sum(xs)), float(np.sum(ys))
+        lat, lon = xy_m_to_latlon(xw, yw, self.lat0, self.lon0)
+        return LatLon(lat, lon)
 
-            xs, ys = [], []
-            for w_i, ll in zip(w, class_locs):
-                x, y = latlon_to_xy_m(ll.lat, ll.lon, self.lat0, self.lon0)
-                xs.append(w_i * x); ys.append(w_i * y)
-            xw, yw = float(np.sum(xs)), float(np.sum(ys))
-            lat, lon = xy_m_to_latlon(xw, yw, self.lat0, self.lon0)
-            pred = LatLon(lat, lon)
 
-            if self.pred_s is None:
-                self.pred_s = pred
-            else:
-                # Enhanced smoothing based on detection confidence
-                alpha = self.pos_alpha * (1.0 + detection_confidence * 0.5)
-                alpha = min(0.8, alpha)  # Cap the smoothing factor
-                
-                self.pred_s = LatLon(
-                    lat=self.pred_s.lat * (1 - alpha) + pred.lat * alpha,
-                    lon=self.pred_s.lon * (1 - alpha) + pred.lon * alpha
-                )
-                
-                # Integrate optical flow if available and building detection is weak
-                if flow_position is not None and flow_confidence > 0.4 and detection_confidence < 0.6:
-                    flow_blend = min(0.3, flow_confidence * 0.5)
-                    self.pred_s = LatLon(
-                        lat=self.pred_s.lat * (1 - flow_blend) + flow_position.lat * flow_blend,
-                        lon=self.pred_s.lon * (1 - flow_blend) + flow_position.lon * flow_blend
-                    )
+class EmaPositionSmoother(IPositionSmoother):
+    def __init__(self, alpha: float):
+        self.alpha = alpha
+        self.state: Optional[LatLon] = None
 
-        # Store position history for analysis
-        self.position_history.append(self.pred_s)
-        self.detection_confidence_history.append(detection_confidence)
-        if len(self.position_history) > self.max_history:
-            self.position_history.pop(0)
-            self.detection_confidence_history.pop(0)
+    def update(self, position: Optional[LatLon], dt: float) -> Optional[LatLon]:
+        if position is None:
+            return self.state
+        if self.state is None:
+            self.state = position
+            return self.state
+        self.state = LatLon(
+            lat=self.state.lat * (1 - self.alpha) + position.lat * self.alpha,
+            lon=self.state.lon * (1 - self.alpha) + position.lon * self.alpha,
+        )
+        return self.state
 
-        # Calculate speed with enhanced smoothing
+
+class DisplacementSpeedEstimator(ISpeedEstimator):
+    def __init__(self, speed_alpha: float = 0.0):
+        self.prev: Optional[LatLon] = None
+        self.speed_alpha = speed_alpha
+        self.speed_state: float = 0.0
+
+    def update(self, position: Optional[LatLon], dt: float) -> Tuple[float, float]:
+        if position is None or dt <= 0:
+            return self.speed_state, self.speed_state * 3.6
         speed_mps = 0.0
-        if self.prev_s is not None and dt > 0:
-            d_m = haversine_m(self.prev_s.lat, self.prev_s.lon, self.pred_s.lat, self.pred_s.lon)
+        if self.prev is not None:
+            d_m = haversine_m(self.prev.lat, self.prev.lon, position.lat, position.lon)
             speed_mps = d_m / dt
-            
-            # Smooth speed based on history
-            if len(self.position_history) >= 3:
-                # Calculate average speed from recent positions
-                recent_speeds = []
-                for i in range(1, min(4, len(self.position_history))):
-                    if i < len(self.position_history):
-                        prev_pos = self.position_history[-i-1]
-                        curr_pos = self.position_history[-i]
-                        if prev_pos is not None and curr_pos is not None:
-                            dist = haversine_m(prev_pos.lat, prev_pos.lon, curr_pos.lat, curr_pos.lon)
-                            recent_speeds.append(dist / dt)
-                
-                if recent_speeds:
-                    avg_speed = np.mean(recent_speeds)
-                    speed_mps = speed_mps * 0.7 + avg_speed * 0.3  # Blend current and historical speed
-        
-        self.prev_s = self.pred_s
-        return self.pred_s, speed_mps, speed_mps * 3.6
+        self.prev = position
+        if self.speed_alpha > 0:
+            self.speed_state = (1 - self.speed_alpha) * self.speed_state + self.speed_alpha * speed_mps
+        else:
+            self.speed_state = speed_mps
+        return self.speed_state, self.speed_state * 3.6
+
+
+class PositionEstimator:
+    """
+    Composes strategies for prediction, smoothing, and speed.
+    """
+    def __init__(self, predictor: IPositionPredictor, smoother: IPositionSmoother, speed: ISpeedEstimator):
+        self.predictor = predictor
+        self.smoother = smoother
+        self.speed = speed
+
+    def estimate(self, class_weights: List[float], class_locs: List[LatLon], dt: float) -> Tuple[Optional[LatLon], float, float]:
+        pred = self.predictor.predict(class_weights, class_locs)
+        smoothed = self.smoother.update(pred, dt)
+        spd_mps, spd_kmh = self.speed.update(smoothed, dt)
+        return smoothed, spd_mps, spd_kmh
+    
+    def update_flow(self, frame, dt: float, altitude: float, fov_x_deg: float, fov_y_deg: float, pitch_deg: float = 60.0):
+        """Update optical flow if predictor supports it"""
+        if hasattr(self.predictor, 'update_flow'):
+            self.predictor.update_flow(frame, dt, altitude, fov_x_deg, fov_y_deg, pitch_deg)
+    
+    def get_current_mode(self) -> str:
+        """Get current prediction mode if supported"""
+        if hasattr(self.predictor, 'get_current_mode'):
+            return self.predictor.get_current_mode()
+        return "unknown"
+    
+    def get_flow_velocity(self) -> Tuple[float, float]:
+        """Get flow velocity if available"""
+        if hasattr(self.predictor, 'get_flow_velocity'):
+            return self.predictor.get_flow_velocity()
+        return (0.0, 0.0)
+    
+    def get_flow_speed_kmh(self) -> float:
+        """Get flow speed if available"""
+        if hasattr(self.predictor, 'get_flow_speed_kmh'):
+            return self.predictor.get_flow_speed_kmh()
+        return 0.0
+    
+    def get_flow_heading_deg(self) -> float:
+        """Get flow heading if available"""
+        if hasattr(self.predictor, 'get_flow_heading_deg'):
+            return self.predictor.get_flow_heading_deg()
+        return 0.0
+    
+    def is_flow_stable(self) -> bool:
+        """Check if flow is stable if available"""
+        if hasattr(self.predictor, 'is_flow_stable'):
+            return self.predictor.is_flow_stable()
+        return False
+
+
+class KalmanCvSmoother(IPositionSmoother):
+    """
+    Constant-velocity Kalman smoother in local meters (x,y,vx,vy).
+    Converts LatLon<->meters using fixed origin defined by predictor's reference (passed at init).
+    """
+    def __init__(self, lat0: float, lon0: float, q_pos: float = 1.0, q_vel: float = 1.0, r_pos: float = 9.0):
+        from geo import latlon_to_xy_m, xy_m_to_latlon  # local import to avoid cycles at top
+        self.lat0 = lat0
+        self.lon0 = lon0
+        self._to_xy = latlon_to_xy_m
+        self._to_ll = xy_m_to_latlon
+        # state x = [x, y, vx, vy]
+        self.x = None  # shape (4,1)
+        self.P = None  # shape (4,4)
+        # process/measurement noise (tuned constants; can be config-driven later)
+        self.q_pos = q_pos
+        self.q_vel = q_vel
+        self.r_pos = r_pos
+
+    def update(self, position: Optional[LatLon], dt: float) -> Optional[LatLon]:
+        import numpy as np
+        if dt <= 0:
+            dt = 1e-3
+        # Build motion model
+        F = np.array([[1, 0, dt, 0],
+                      [0, 1, 0, dt],
+                      [0, 0, 1, 0],
+                      [0, 0, 0, 1]], dtype=float)
+        G = np.array([[0.5*dt*dt, 0],
+                      [0, 0.5*dt*dt],
+                      [dt, 0],
+                      [0, dt]], dtype=float)
+        Q = G @ np.diag([self.q_pos, self.q_pos]) @ G.T + np.diag([0,0,self.q_vel,self.q_vel]) * 1e-6
+        H = np.array([[1, 0, 0, 0],
+                      [0, 1, 0, 0]], dtype=float)
+        R = np.eye(2) * self.r_pos
+
+        # Predict step
+        if self.x is not None:
+            self.x = F @ self.x
+            self.P = F @ self.P @ F.T + Q
+
+        # Update with measurement (if available)
+        if position is not None:
+            zx, zy = self._to_xy(position.lat, position.lon, self.lat0, self.lon0)
+            z = np.array([[zx], [zy]])
+            if self.x is None:
+                # init state from first position
+                self.x = np.array([[zx],[zy],[0.0],[0.0]])
+                self.P = np.eye(4) * 100.0
+            else:
+                S = H @ self.P @ H.T + R
+                K = self.P @ H.T @ np.linalg.inv(S)
+                y = z - (H @ self.x)
+                self.x = self.x + K @ y
+                self.P = (np.eye(4) - K @ H) @ self.P
+
+        if self.x is None:
+            return None
+        x, y = float(self.x[0,0]), float(self.x[1,0])
+        lat, lon = self._to_ll(x, y, self.lat0, self.lon0)
+        return LatLon(lat, lon)
